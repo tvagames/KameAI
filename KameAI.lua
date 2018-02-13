@@ -1,37 +1,40 @@
+
 --------------------
 -- オプション
 --------------------
 -- 敵との位置関係
-MIN_DISTANCE = 1500
-MAX_DISTANCE = 1550
-MIN_ANGLE = 60
+MIN_DISTANCE = 500
+MAX_DISTANCE = 1300
+MIN_ANGLE = 30
 MAX_ANGLE = 120
-SWING_ANGLE = 30
+SWING_ANGLE = 20
 
 -- 高度
-CRUISE_ALT = 400
+CRUISE_ALT = -100
 MAX_ALT = 500
-MIN_ALT = 300
+MIN_ALT = -500
+FROM_TARGET_ALT = nil -- 敵を基準とした高度。MAXとMINの間に丸める
 
 -- ハイドロフォイルブースターのヨー操作利用
-HYDROFOIL_YAW_ANGLE = 0
+HYDROFOIL_YAW_ANGLE = 30
 HYDROFOIL_STANDBY_ANGLE = 135
 
 -- 横向き魚雷
 AIM_SIDEWAYS_SLOT = 1
 
 -- 回避
-AVOID_TERRAIN_DISTANCE = 1000
-AVOID_TERRAIN_ALT = 370
+AVOID_TERRAIN_DISTANCE_RATE = 10
+AVOID_TERRAIN_ALT_UPPER = -30
+AVOID_TERRAIN_ALT_LOWER = -1000
 DETECT_TERRAIN_ANGLE = 40
-AVOID_FRIEND_DISTANCE = 100
+AVOID_FRIEND_DISTANCE_RATE = 5
 AVOID_FRIEND_ANGLE = 90
-AVOID_ENEMY_DISTANCE = 200
+AVOID_ENEMY_DISTANCE = 500
 AVOID_ENEMY_ANGLE = 90
 
 -- 修理
 REPAIR_DISTANCE = 50
-MAX_REPAIR_DISTANCE = 100
+MAX_REPAIR_DISTANCE = 15
 
 -- 0 = around (for side weapons), 
 -- 1 = figure 8 (for front weapons), 
@@ -40,7 +43,7 @@ MAX_REPAIR_DISTANCE = 100
 -- 4 = follower
 -- 5 = back to enemy
 -- 6 = front to enemy
-ROUTE_PATTERN = 1
+ROUTE_PATTERN = 0
 
 -- 0 = horizon
 -- 1 = upside down (天地逆転)
@@ -53,16 +56,26 @@ PITCH_TYPE = 0
 -- 0 = hovering
 -- 1 = elevator
 -- 2 = escalator
-ALT_MANEUVER = 0
+-- 3 = elevator follow terrain. ignore CRUISE_ALT
+-- 4 = escalator follow terrain. ignore CRUISE_ALT
+ALT_MANEUVER = 3
+ALT_FOLLOW_TERRAIN_DISTANCE = 20 -- 地形追従・高度回避で維持する地形との距離。nilは地形追従・高度回避しない
 
 FORWARD_USE_YAWING = false
 CUTOFF_PITCH_OVER = true
 CUTOFF_ROLL_OVER = true
-ALT_CONTROL_MIN_ZERO = true
+CUTOFF_UNFORWARD = true
+ALT_CONTROL_MIN_ZERO = false
 
-MISSLE_TOP_ATTACK_ENABLED = true
-MISSLE_RUN_DISTANCE = 500
-MISSLE_RUN_ALTITUDE = 500
+MISSILE_TOP_ATTACK_ENABLED = false
+MISSILE_RUN_DISTANCE = 350
+MISSILE_RUN_ALTITUDE = 400
+MISSILE_LAUNCH_TYPE = 0 -- 0 = VLS
+MISSILE_MULTI_LOCK_COUNT = 3
+MISSILE_USED_MAINFRAME = 0
+MISSILE_ASSIGN_TARGET_DISTANCE = 2500
+
+ALT_DEDIBLADE_RANGE_FROM_COM = 15
 
 --------------------
 -- 構造的制約メモ
@@ -96,10 +109,10 @@ PidTurning.CreateConfig = function(p, i, d)
     return self
   end
 
-ppid = PidTurning.CreateConfig(0.1, 400, 1) -- 1200 * 25msecs = 30secs
+ppid = PidTurning.CreateConfig(0.05, 400, 1) -- 1200 * 25msecs = 30secs
 apid = PidTurning.CreateConfig(0.05, 1200, 1)
 rpid = PidTurning.CreateConfig(0.1, 400, 3)
-fpid = PidTurning.CreateConfig(0.1, 1200, 10)
+fpid = PidTurning.CreateConfig(1.0, 1200, 1)
 ypid = PidTurning.CreateConfig(0.1, 1200, 3)
   
 
@@ -168,48 +181,153 @@ function GetDistance(a, b)
   return (a - b).magnitude
 end
 
+function IsTransceiverAssigned(transceiverItem, targets)
+  for index = 1, table.maxn(targets), 1 do
+    
+    if transceiverItem.TargetId == targets[index].Id and targets[index].Info.AimPointPosition ~= nil then
+      targets[index].AssignedCount = targets[index].AssignedCount + 1
+      transceiverItem.TargetInfo = targets[index].Info
+      return transceiverItem
+    end
+  end
+  return nil
+end
 
 
 --------------------
 -- 
 --------------------
-function ControlMissiles(I, target)
-  local aim = target.AimPointPosition
+transceiverMap = {}
+function SetMissleTargets(I)
+  -- ターゲットリストの作成
+  local targets = {}
+  for mainframeIndex = 0, I:GetNumberOfMainframes() - 1, 1 do
+    for targetIndex = 0, I:GetNumberOfTargets(mainframeIndex) - 1, 1 do
+      local targetInfo = I:GetTargetInfo(mainframeIndex, targetIndex)
+      local d = GetDistance(targetInfo.Position, me.selfPos)
+      if d < MISSILE_ASSIGN_TARGET_DISTANCE then
+        table.insert(targets, {Id = targetInfo.Id, Info = targetInfo, AssignedCount = 0})
+        if MISSILE_MULTI_LOCK_COUNT ~= 0 and table.maxn(targets) == MISSILE_MULTI_LOCK_COUNT then
+          break
+        end
+      end
+    end
+  end
+
+  if table.maxn(targets) == 0 then
+    return
+  end
+    
+
+  local newMap = {}
+  local unassinedMap = {}
+  -- 割り当て済みの判定
   for luaTransceiverIndex = 0, I:GetLuaTransceiverCount() - 1, 1 do
+    local isAssined = false
     local transcieverInfo = I:GetLuaTransceiverInfo(luaTransceiverIndex)
+    local i = 1
+    while (table.maxn(transceiverMap) >= i) do
+      if transceiverMap[i].LocalPosition == transcieverInfo.LocalPosition then
+        local assigned = IsTransceiverAssigned(transceiverMap[i], targets)
+        if assigned ~= nil then
+          transceiverMap[i] = assigned
+          transceiverMap[i].Index = luaTransceiverIndex
+          table.insert(newMap, transceiverMap[i])
+          table.remove(transceiverMap, i)
+          isAssined = true
+          break
+        end
+      end
+      i = i + 1
+    end 
+
+    if isAssined == false then
+      table.insert(unassinedMap, {LocalPosition = transcieverInfo.LocalPosition, TargetId = nil, Index = luaTransceiverIndex})
+    end
+  end
+
+  -- 未割当をアサイン
+  for index = 1, table.maxn(unassinedMap), 1 do
+    local minCount = nil
+    local minCountIndex = nil
+    for targetIndex = 1, table.maxn(targets), 1 do
+      if minCount == nil or targets[targetIndex].AssignedCount < minCount then
+        minCount = targets[targetIndex].AssignedCount
+        minCountIndex = targetIndex
+      end
+    end
+
+    table.insert(newMap, {Index = unassinedMap[index].Index,
+                          LocalPosition = unassinedMap[index].LocalPosition, 
+                          TargetId = targets[minCountIndex].Id, 
+                          TargetInfo = targets[minCountIndex].Info})
+
+    targets[minCountIndex].AssignedCount = targets[minCountIndex].AssignedCount + 1
+  end
+
+  transceiverMap = newMap
+  
+end
+
+--------------------
+-- 
+--------------------
+function ControlMissiles(I)
+  
+  SetMissleTargets(I)
+
+  
+  for index = 1, table.maxn(transceiverMap), 1 do
+    local luaTransceiverIndex = transceiverMap[index].Index
+    local transcieverInfo = transceiverMap[index].Info
+    local target = transceiverMap[index].TargetInfo
+    local aim = target.AimPointPosition
+    if aim == nil then
+      aim = target.Position
+    end
+  -- end
+  -- for luaTransceiverIndex = 0, I:GetLuaTransceiverCount() - 1, 1 do
+  --   local transcieverInfo = I:GetLuaTransceiverInfo(luaTransceiverIndex)
     for missileIndex = 0, I:GetLuaControlledMissileCount(luaTransceiverIndex) - 1, 1 do
       local missileInfo = I:GetLuaControlledMissileInfo(luaTransceiverIndex,missileIndex)
-      local missilePosition = missileInfo.Position
-      local d = GetDistance(aim, missilePosition)
-      local d2 = GetDistance(aim, Vector3(missilePosition.x, aim.y, missilePosition.z))
-      if d < 100 then
-        local hitTime = d / (missileInfo.Velocity - target.Velocity).magnitude
-        aim = target.AimPointPosition + target.Velocity * hitTime
-      end
-
-      local a = (aim - missilePosition)
-      local b = missilePosition + (a.normalized * (a.magnitude / 3))
-
-      if target.Velocity.magnitude > 20 then
-        -- direct
-        if d < 5 then
+      if missileInfo.Valid then
+        local missilePosition = missileInfo.Position
+        local d = GetDistance(aim, missilePosition)
+        local d2 = GetDistance(aim, Vector3(missilePosition.x, aim.y, missilePosition.z))
+        
+        if d < MISSILE_RUN_DISTANCE and target.Velocity.magnitude > 20 then
+          local hitTime = d / (missileInfo.Velocity - target.Velocity).magnitude
+          aim = target.AimPointPosition + target.Velocity * hitTime
+        end
+  
+        local a = (aim - missilePosition)
+        local b = missilePosition + (a.normalized * (a.magnitude / 4))
+  
+        if target.Velocity.magnitude > 20 then
+          -- direct
+          if d < 1 then
+            I:DetonateLuaControlledMissile(luaTransceiverIndex, missileIndex)
+          else
+            I:SetLuaControlledMissileAimPoint(luaTransceiverIndex, missileIndex, aim.x, aim.y, aim.z)
+          end
+        elseif d2 > MISSILE_RUN_DISTANCE and MISSILE_TOP_ATTACK_ENABLED then
+          if MISSILE_LAUNCH_TYPE then
+            -- top attack
+            if missilePosition.y < 200 then
+              I:SetLuaControlledMissileAimPoint(luaTransceiverIndex, missileIndex, missilePosition.x, MISSILE_RUN_ALTITUDE, missilePosition.z)
+            else
+              I:SetLuaControlledMissileAimPoint(luaTransceiverIndex, missileIndex, b.x, MISSILE_RUN_ALTITUDE, b.z)
+            end
+          else
+            -- bottom attack
+            I:SetLuaControlledMissileAimPoint(luaTransceiverIndex, missileIndex, b.x, Mathf.Max(100, aim.y - MISSILE_RUN_ALTITUDE), b.z)
+          end
+        elseif d < 1 then
           I:DetonateLuaControlledMissile(luaTransceiverIndex, missileIndex)
         else
           I:SetLuaControlledMissileAimPoint(luaTransceiverIndex, missileIndex, aim.x, aim.y, aim.z)
         end
-      elseif d2 > MISSLE_RUN_DISTANCE and MISSLE_TOP_ATTACK_ENABLED then
-        if aim.y < missilePosition.y then
-          -- top attack
-          I:SetLuaControlledMissileAimPoint(luaTransceiverIndex, missileIndex, b.x, aim.y + MISSLE_RUN_ALTITUDE, b.z)
-        else
-          -- bottom attack
-          I:SetLuaControlledMissileAimPoint(luaTransceiverIndex, missileIndex, b.x, Mathf.Max(100, aim.y - MISSLE_RUN_ALTITUDE), b.z)
         end
-      elseif d < 0 then
-        I:DetonateLuaControlledMissile(luaTransceiverIndex, missileIndex)
-      else
-        I:SetLuaControlledMissileAimPoint(luaTransceiverIndex, missileIndex, aim.x, aim.y, aim.z)
-      end
     end
   end
 end
@@ -315,10 +433,10 @@ function RequestControl(I, me, request, repairTarget)
         local pp = 0
         local pa = request.again
     
-        if info.LocalPositionRelativeToCom.z > 5 then
+        if info.LocalPositionRelativeToCom.z > ALT_DEDIBLADE_RANGE_FROM_COM then
           pp = -request.pgain * info.LocalForwards.z
           pa = 0
-        elseif info.LocalPositionRelativeToCom.z < -5 then
+        elseif info.LocalPositionRelativeToCom.z < -ALT_DEDIBLADE_RANGE_FROM_COM then
           pp = request.pgain * info.LocalForwards.z
           pa = 0
         elseif ALT_CONTROL_MIN_ZERO and pa < 0 then
@@ -489,15 +607,16 @@ end
 function DetectTerrainAngle(I, direction, detectAngle, angleResolution)
   local distanceResolution = 20
   local score = 0
+  local avoidTerrainDistance = AVOID_TERRAIN_DISTANCE_RATE * me.mag
   for angle = angleResolution, detectAngle, angleResolution do
     local q = Quaternion.Euler(0, angle * direction, 0) * (me.fvec * me.isForwarding)
     local scoreAtAngle = 0
-    for distance = distanceResolution, AVOID_TERRAIN_DISTANCE, distanceResolution do
+    for distance = distanceResolution, avoidTerrainDistance, distanceResolution do
       local point = me.selfPos + (q * distance)
       local terrain = I:GetTerrainAltitudeForPosition(point)
   
-      if AVOID_TERRAIN_ALT < terrain then
-        scoreAtAngle = scoreAtAngle + (AVOID_TERRAIN_DISTANCE - distance)
+      if InRange(terrain, AVOID_TERRAIN_ALT_LOWER, AVOID_TERRAIN_ALT_UPPER) == false then
+        scoreAtAngle = scoreAtAngle + (avoidTerrainDistance - distance)
         break
       end
     end
@@ -568,6 +687,7 @@ function AvoidCollision(I, me, followTarget, request)
   -- 味方回避
   local friendJudge = nil
   local fridneDistance = nil
+  local avoidFriendDistance = AVOID_FRIEND_DISTANCE_RATE * me.mag
   for index = 0, I:GetFriendlyCount() - 1, 1 do
     local info = I:GetFriendlyInfo(index)
     local targetPosition = me.selfPos
@@ -588,12 +708,12 @@ function AvoidCollision(I, me, followTarget, request)
         I:Log("detect friend0 ".. avoidJudge.steer)
       else
         -- 自分が味方の前にいる、または、後ろにいるけど遠い
-        avoidJudge = AvoidTarget(I, me, info.ReferencePosition, AVOID_FRIEND_ANGLE, AVOID_FRIEND_DISTANCE)
+        avoidJudge = AvoidTarget(I, me, info.ReferencePosition, AVOID_FRIEND_ANGLE, avoidFriendDistance)
         ret.friend = true
         I:Log("detect friend1 ".. avoidJudge.steer)
       end
     else
-      avoidJudge = AvoidTarget(I, me, info.ReferencePosition, AVOID_FRIEND_ANGLE, AVOID_FRIEND_DISTANCE)
+      avoidJudge = AvoidTarget(I, me, info.ReferencePosition, AVOID_FRIEND_ANGLE, avoidFriendDistance)
       ret.friend = true
       I:Log("detect friend2")
     end
@@ -611,14 +731,16 @@ function AvoidCollision(I, me, followTarget, request)
   end
 
   -- 正面地形回避
-  for distance = distanceResolution, AVOID_TERRAIN_DISTANCE, distanceResolution do
+  local avoidTerrainDistance = AVOID_TERRAIN_DISTANCE_RATE * me.mag
+
+  for distance = distanceResolution, avoidTerrainDistance, distanceResolution do
     local terrain = I:GetTerrainAltitudeForPosition(me.selfPos + (me.fvec * distance * request.needForward))
-    if AVOID_TERRAIN_ALT < terrain then
+    if InRange(terrain, AVOID_TERRAIN_ALT_LOWER, AVOID_TERRAIN_ALT_UPPER) == false then
       ResetSwitch()
       ret = DetectTerrainRange(I, 180, 10)
       ret.distance = distance
-      ret.distanceRate = (distance / AVOID_TERRAIN_DISTANCE)
-      I:Log("detect terrain")
+      ret.distanceRate = (distance / avoidTerrainDistance)
+      I:Log("detect terrain".. terrain..", "..AVOID_TERRAIN_ALT_LOWER .."-"..AVOID_TERRAIN_ALT_UPPER)
       return ret
     end
   end
@@ -651,12 +773,8 @@ function GetControlRequest(I, me, tpi, forwardDrive, followTarget)
   end
 
   local needRoll = 0
-  -- if UPSIDE_DOWN == 1 then
-  --   needRoll = 180
-  -- end
-
   local needPitch = 0
-
+  local needAlt = CRUISE_ALT
 
   ret.forwardDrive = forwardDrive
   ret.steer = 0
@@ -666,35 +784,121 @@ function GetControlRequest(I, me, tpi, forwardDrive, followTarget)
   --local p = me.pitch
   --local a = Angle(me.vvec, me.fvec)
 
-  if followTarget ~= nil and followTarget.Info ~= nil and avoid.friend ~= true then
+  if ALT_FOLLOW_TERRAIN_DISTANCE ~= nil then
+    -- 地形追従
+    local minAngle = 0
+    local maxAngle = 0
+    local minAlt = nil
+    local maxAlt = nil
+    local forwardingRate = me.isForwarding
+    if forwardingRate == 0 then
+      forwardingRate = 1
+    end
+
+    for distance = 0, AVOID_TERRAIN_DISTANCE_RATE * me.mag, 5 do
+      local point = me.com + (me.fvec * forwardingRate * distance)
+      local terrain = I:GetTerrainAltitudeForPosition(point)
+      local terrainPos = Vector3(point.x, terrain, point.z)
+      local vectorToTerrain = terrainPos - me.selfPos
+      local angleToTerrain = Angle(vectorToTerrain, me.fvec * forwardingRate)
+      local altDirection = 0
+
+      if minAngle > angleToTerrain then
+        minAngle = angleToTerrain
+      end
+      if minAlt == nil or minAlt < terrain + ALT_FOLLOW_TERRAIN_DISTANCE then
+        minAlt = terrain + ALT_FOLLOW_TERRAIN_DISTANCE
+      end
+    end
+
+    I:Log("minAlt"..minAlt)
+
+    if ALT_MANEUVER == 1 then
+      -- elevator
+      if AVOID_TERRAIN_ALT_UPPER < minAlt then
+        needAlt = AVOID_TERRAIN_ALT_UPPER
+      elseif me.com.y < CRUISE_ALT then
+        needAlt = CRUISE_ALT
+      elseif AVOID_TERRAIN_ALT_LOWER > minAlt then
+        needAlt = AVOID_TERRAIN_ALT_LOWER
+      end
+
+    elseif ALT_MANEUVER == 2 then
+      -- escalator
+      if maxAngle > 0 then
+        needPitch = maxAngle
+      elseif me.selfPos.y < CRUISE_ALT then
+        needAlt = CRUISE_ALT
+      end
+    elseif ALT_MANEUVER == 3 then
+      -- elevator follow terrain
+      if AVOID_TERRAIN_ALT_UPPER < minAlt then
+        needAlt = AVOID_TERRAIN_ALT_UPPER
+      elseif AVOID_TERRAIN_ALT_LOWER > minAlt then
+        needAlt = AVOID_TERRAIN_ALT_LOWER
+      else
+        needAlt = minAlt
+      end
+    elseif ALT_MANEUVER == 4 then
+      -- escalator follow terrain
+      if maxAngle > 0 then
+        needPitch = maxAngle
+      elseif minAngle < 0 then
+        needPitch = minAngle
+      end
+    end
+
+  end
+
+  if followTarget ~= nil and followTarget.Info ~= nil then
     -- 修理対象の真後ろ50mを目指す
     local vectorToTarget = (me.selfPos - followTarget.Info.ReferencePosition)
+    local vectorFromTarget = (followTarget.Info.ReferencePosition - me.selfPos)
     local nosePos = me.selfPos + (me.fvec * I:GetConstructMaxDimensions().z)
     local destination = followTarget.Info.ReferencePosition - (followTarget.Info.ForwardVector * (REPAIR_DISTANCE + followTarget.Info.NegativeSize.z))
     local vectorToDest = (destination - nosePos)
     local side = Vector3.Dot(vectorToDest.normalized, me.rvec)
     local angle = Angle(vectorToDest, me.fvec)
     local front = Vector3.Dot(vectorToDest.normalized, me.fvec)
+    local fromFront = Vector3.Dot(vectorFromTarget.normalized, followTarget.Info.Velocity.normalized)
     local s = ((180 - angle) ^ 3) / (180 ^ 3)
     if vectorToDest.magnitude > 300 then
       f = s
     else
       f = vectorToDest.magnitude / 300 * s
     end
-    if front > 0 or (front < 0 and vectorToDest.magnitude > 300) then
+    if fromFront > 0 and vectorToDest.magnitude > 500 then
+      I:Log("repair 1")
+      -- 目標の前方にいる（遠め）
+      if side > 0 and angle > 5 then
+        ret.steer = -1
+      elseif side < 0 and angle > 5 then
+        ret.steer = 1
+      end
+    elseif vectorToDest.magnitude < 100 then
+      I:Log("repair 2")
+      if side > 0 and angle > 5 then
+        ret.steer = -1
+      elseif side < 0 and angle > 5 then
+        ret.steer = 1
+      end
+    elseif front > 0 or (front < 0 and vectorToDest.magnitude > 300) then
+      I:Log("repair 3")
       if side > 0 and angle > 5 then
         ret.steer = 1
       elseif side < 0 and angle > 5 then
         ret.steer = -1
       end
     elseif front < 0 and vectorToDest.magnitude < 300 then
+      I:Log("repair 4")
       if side > 0 and angle > 5 then
         ret.steer = 1
       elseif side < 0 and angle > 5 then
         ret.steer = -1
       end
-      me.isForwarding = -1
+      f = -f
     elseif front < 0 and vectorToDest.magnitude > MAX_REPAIR_DISTANCE then
+      I:Log("repair 5")
       if side > 0 then
         ret.steer = -1
       elseif side < 0 then
@@ -707,7 +911,7 @@ function GetControlRequest(I, me, tpi, forwardDrive, followTarget)
 
     ret.ygain = Pid:GetGain(I, "YAW", ypid, ret.steer, lasyYaw)
     lasyYaw = ret.ygain
-    I:Log("MOVE TO REPAIR! req:a=".. ret.again..", r=".. ret.rgain.. ", pgain=".. ret.pgain.. ", forwardDrive=".. forwardDrive)
+    I:Log("MOVE TO REPAIR!")
   end
 
 
@@ -718,6 +922,16 @@ function GetControlRequest(I, me, tpi, forwardDrive, followTarget)
     local side = Vector3.Dot(vectorToTarget.normalized, me.rvec)
     local angle = Angle(vectorToTarget, me.fvec)
     local targetDistance = vectorToTarget.magnitude
+
+    if FROM_TARGET_ALT ~= nil then
+      needAlt = targetPosition.y + FROM_TARGET_ALT
+      if MAX_ALT < needAlt then
+        needAlt = MAX_ALT
+      end
+      if MIN_ALT > needAlt then
+        needAlt = MIN_ALT
+      end
+    end
 
     if PITCH_TYPE == 1 then
       -- local p1 = Vector3.Project(vectorToTarget, me.rvec)
@@ -926,6 +1140,11 @@ function GetControlRequest(I, me, tpi, forwardDrive, followTarget)
 --    ret.hydrofoilBooster = 0
   end
 
+  if CUTOFF_UNFORWARD and me.isForwarding == 0 then
+    ret.cutoff = true
+    ret.isHeliYaw = false
+  end
+
   if ret.forwardDrive > 0 then
     ret.needForward = 1
   elseif ret.forwardDrive < 0 then
@@ -934,10 +1153,9 @@ function GetControlRequest(I, me, tpi, forwardDrive, followTarget)
     ret.needForward = 0
   end
 
-  -- 回避最優先
-  I:Log("forwardDrive"..forwardDrive)
   local avoid = AvoidCollision(I, me, followTarget, ret)
-  I:Log("AvoidCollision"..avoid.steer)
+
+  -- 回避最優先
   if avoid.steer > 0 then
     ret.steer = avoid.steer
     ret.forwardDrive = avoid.distanceRate
@@ -950,10 +1168,10 @@ function GetControlRequest(I, me, tpi, forwardDrive, followTarget)
 
   ret.pgain = Pid:GetGain(I, "PITCH", ppid, needPitch, me.pitch)
   ret.rgain = Pid:GetGain(I, "ROLL", rpid, needRoll, me.roll)
-  ret.again = Pid:GetGain(I, "ALT", apid, CRUISE_ALT, me.selfPos.y)
+  ret.again = Pid:GetGain(I, "ALT", apid, needAlt, me.selfPos.y)
   ret.ygain = Pid:GetGain(I, "YAW", ypid, ret.steer, lasyYaw)
   lasyYaw = ret.ygain
-
+  I:Log("needAlt"..needAlt.. ",needPitch="..needPitch)
   I:Log("req:turnSwitch=".. turnSwitch..",a=".. ret.again..", r=".. ret.rgain.. ", pgain=".. ret.pgain)
   return ret
 end
@@ -994,21 +1212,26 @@ end
 --------------------
 -- 
 --------------------
+lastHelth = ""
 function ViewHelth(I)
   local i=1
-  while (I.Fleet.Members[i].CenterOfMass ~= me.com) do
+  while (I.Fleet ~= nil and I.Fleet.Members ~= nil and I.Fleet.Members[i].CenterOfMass ~= me.com) do
    i=i+1
   end
   
   local myname = I:GetFriendlyInfoById(I.Fleet.Members[i].Id).BlueprintName
-  local myhp = math.floor(I:GetHealthFraction()*100)
-  local myAmmo = math.floor(I:GetAmmoFraction()*100)
-  local myFuel = math.floor(I:GetFuelFraction()*100)
-  
+  local myhp = math.floor(I:GetHealthFraction()*50)*2
+  local myAmmo = math.floor(I:GetAmmoFraction()*10)*10
+  local myFuel = math.floor(I:GetFuelFraction()*10)*10
+  local s = ""
   if I.Fleet.Name == myname then
-    I:LogToHud(myname .." HP:"..myhp.."%" .." Ammo:"..myAmmo.."%" .." Fuel:"..myFuel.."%")
+    s = myname .." HP:"..myhp.."%" .." Ammo:"..myAmmo.."%" .." Fuel:"..myFuel.."%"
   else
-    I:LogToHud(I.Fleet.Name .. " " .. myname .." HP:"..myhp.."%" .." Ammo:"..myAmmo.."%" .." Fuel:"..myFuel.."%")
+    s = I.Fleet.Name .. " " .. myname .." HP:"..myhp.."%" .." Ammo:"..myAmmo.."%" .." Fuel:"..myFuel.."%"
+  end
+  if lastHelth ~= s then
+    I:LogToHud(s)
+    lastHelth = s
   end
 end
 
@@ -1035,7 +1258,8 @@ function GetVehicleStatus(I)
   me.vvec = I:GetVelocityVectorNormalized()
   me.fmag = I:GetForwardsVelocityMagnitude()
   me.pitch = ZeroOrigin(I:GetConstructPitch())
-  
+  me.mag = I:GetVelocityMagnitude()  
+
   if UPSIDE_DOWN == 1 then
     me.roll = I:GetConstructRoll() - 180
   else
@@ -1161,8 +1385,9 @@ function Update(I)
   end
 
   if ti ~= nil then
-    ControlMissiles(I, ti)
+    ControlMissiles(I)
   end
 
   ViewHelth(I)
 end
+
